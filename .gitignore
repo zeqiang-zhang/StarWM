@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+runs/
+logdir*/
+*.pt
+*.npz
+*.pkl
+events.out.tfevents.*
+envs/dmcgb/data/
+baselines/upstream/
+.ipynb_checkpoints/

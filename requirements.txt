@@ -1,0 +1,26 @@
+# Versions of the environment used for the paper's runs
+# (Python 3.12, CUDA 12.6; NVIDIA A100 / H100).
+torch==2.10.0
+numpy==2.3.5
+mujoco==3.5.0
+dm_control==1.0.37
+dm-env
+gymnasium==1.2.3
+ruamel.yaml==0.19.1
+tensorboard==2.20.0
+opencv-python-headless==4.13.0.92
+xmltodict==1.0.4
+pillow==11.3.0
+cloudpickle
+
+# Shape / NoisyShape environments (separate repository)
+shapeenv @ git+https://github.com/zeqiang-zhang/ShapeEnv.git
+# (or from a local clone:  pip install -e ../ShapeEnv)
+
+# Analysis, probes and figures
+scikit-learn
+scipy==1.17.1
+pandas
+matplotlib==3.10.8
+tqdm
+rliable==1.2.0

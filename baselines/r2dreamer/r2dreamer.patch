@@ -1,0 +1,323 @@
+diff --git a/buffer.py b/buffer.py
+index c33f38a..dcbee32 100644
+--- a/buffer.py
++++ b/buffer.py
+@@ -9,6 +9,8 @@ class Buffer:
+         self.storage_device = torch.device(config.storage_device)
+         self.batch_size = int(config.batch_size)
+         self.batch_length = int(config.batch_length)
++        # See `sample`: clone the shifted action slice before writing it back.
++        self.clone_shifted_action = bool(config.get("clone_shifted_action", False))
+         self.num_eps = 0
+         self._buffer = ReplayBuffer(
+             storage=LazyTensorStorage(max_size=config.max_size, device=self.storage_device, ndim=2),
+@@ -37,7 +39,15 @@ class Buffer:
+         # The initial ones are used only to extract the latent vector
+         initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
+         data = sample_td[:, 1:]
+-        data.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
++        prev_action = sample_td["action"][:, :-1]
++        if self.clone_shifted_action:
++            # `data` is a view of `sample_td[:, 1:]`, so this is an in-place copy between
++            # overlapping slices of the same storage; copy_ does not guarantee memmove
++            # semantics and was observed to corrupt a small fraction of action vectors on
++            # GPU. Cloning breaks the overlap. Off by default (upstream behaviour, used for
++            # all DMC runs); enabled for the NoisyShape runs.
++            prev_action = prev_action.clone()
++        data.set_("action", prev_action)  # action is 1 step back
+         index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
+         return data, index, initial
+ 
+diff --git a/configs/configs.yaml b/configs/configs.yaml
+index 097a216..ad7ece8 100644
+--- a/configs/configs.yaml
++++ b/configs/configs.yaml
+@@ -23,6 +23,7 @@ buffer:
+   max_size: 5e5
+   device: ${device}
+   storage_device: 'cuda:0'
++  clone_shifted_action: False
+ 
+ trainer:
+   steps: ${env.steps}
+diff --git a/configs/env/dmc_vision.yaml b/configs/env/dmc_vision.yaml
+index e60a500..e770e99 100644
+--- a/configs/env/dmc_vision.yaml
++++ b/configs/env/dmc_vision.yaml
+@@ -6,6 +6,14 @@ action_repeat: 2
+ train_ratio: 512
+ time_limit: 1000
+ 
++# Distractors (StarWM baseline integration)
++video_hard: False             # DMC-GB2 video_hard background (VH)
++video_random_frames: False    # VH: random frame per step (VHR); pixel_video_bg: random DAVIS frame per step
++recolor_agent: False          # low-contrast agent (desaturated agent geoms), used with video_hard
++recolor_rgba: [0.52, 0.47, 0.42, 1.0]
++pixel_video_bg: False         # DAVIS frames composited behind the agent (Reacher)
++distracting_background_path: ''  # DAVIS 2017 JPEGImages/480p; empty -> $DAVIS_DIR
++
+ seed: ${seed}
+ device: ${device}
+ 
+diff --git a/configs/env/noisyshape.yaml b/configs/env/noisyshape.yaml
+new file mode 100644
+index 0000000..4e281a5
+--- /dev/null
++++ b/configs/env/noisyshape.yaml
+@@ -0,0 +1,23 @@
++task: 'noisyshape_default'
++steps: 2e5
++env_num: 1
++eval_episode_num: 10
++action_repeat: 1
++train_ratio: 512
++time_limit: 200
++# DAVIS 2017 JPEGImages/480p directory; empty -> $DAVIS_DIR.
++distracting_background_path: ''
++
++video_hard: False
++video_random_frames: False
++
++seed: ${seed}
++device: ${device}
++
++size: [64, 64]
++encoder:
++  mlp_keys: '$^'
++  cnn_keys: 'image'
++decoder:
++  mlp_keys: '$^'
++  cnn_keys: 'image'
+diff --git a/envs/__init__.py b/envs/__init__.py
+index 65da28f..22e56a1 100644
+--- a/envs/__init__.py
++++ b/envs/__init__.py
+@@ -1,3 +1,5 @@
++import os
++
+ from . import parallel, wrappers
+ 
+ 
+@@ -17,7 +19,17 @@ def make_env(config, id):
+     if suite == "dmc":
+         import envs.dmc as dmc
+ 
+-        env = dmc.DeepMindControl(task, config.action_repeat, config.size, seed=config.seed + id)
++        env = dmc.DeepMindControl(
++            task, config.action_repeat, config.size, seed=config.seed + id,
++            video_hard=getattr(config, 'video_hard', False),
++            video_random_frames=getattr(config, 'video_random_frames', False),
++            recolor_rgba=(getattr(config, 'recolor_rgba', None)
++                          if getattr(config, 'recolor_agent', False) else None),
++            pixel_video_bg=getattr(config, 'pixel_video_bg', False),
++            # DAVIS 2017 JPEGImages/480p (Reacher pixel_video_bg); empty -> $DAVIS_DIR.
++            davis_path=(getattr(config, 'distracting_background_path', None)
++                        or os.environ.get("DAVIS_DIR")),
++        )
+         env = wrappers.NormalizeActions(env)
+     elif suite == "atari":
+         import envs.atari as atari
+@@ -60,6 +72,17 @@ def make_env(config, id):
+             config.camera,
+             config.seed + id,
+         )
++    elif suite == "noisyshape":
++        # NoisyShape diagnostic env from the `shapeenv` package (StarWM paper,
++        # Sec. 4.1). Empty distracting_background_path -> $DAVIS_DIR.
++        import shapeenv
++
++        env = shapeenv.make(
++            "noisyshape", size=config.size, seed=config.seed + id,
++            davis_path=getattr(config, 'distracting_background_path', None) or None,
++        )
++        env = wrappers.FiveToFourTupleStep(env)
++        env = wrappers.OneHotAction(env)
+     else:
+         raise NotImplementedError(suite)
+     env = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)
+diff --git a/envs/dmc.py b/envs/dmc.py
+index 1b28899..5cd45ce 100644
+--- a/envs/dmc.py
++++ b/envs/dmc.py
+@@ -1,11 +1,34 @@
++import glob
++import os
++
+ import gymnasium as gym
+ import numpy as np
++from PIL import Image
++
++
++def _load_davis_videos(davis_path):
++    videos = []
++    if davis_path and os.path.isdir(davis_path):
++        for vdir in sorted(glob.glob(os.path.join(davis_path, "*"))):
++            if os.path.isdir(vdir):
++                frames = sorted(glob.glob(os.path.join(vdir, "*.jpg")))
++                if frames:
++                    videos.append(frames)
++    return videos
+ 
+ 
+ class DeepMindControl(gym.Env):
+     metadata = {}
+ 
+-    def __init__(self, name, action_repeat=1, size=(64, 64), camera=None, seed=0):
++    def __init__(self, name, action_repeat=1, size=(64, 64), camera=None, seed=0,
++                 video_hard=False, video_random_frames=False, recolor_rgba=None,
++                 pixel_video_bg=False, davis_path=None):
++        # _small suffix: widen camera fov so the agent appears half-sized.
++        # Physics are unchanged — reward/action/dynamics match the base task.
++        self._small = name.endswith("_small")
++        if self._small:
++            name = name[: -len("_small")]
++
+         if name.endswith("_subtle"):
+             is_subtle = True
+         else:
+@@ -35,6 +58,26 @@ class DeepMindControl(gym.Env):
+             assert task is None
+             self._env = domain()
+ 
++        if self._small:
++            from envs.small_variant import apply_small_camera
++            apply_small_camera(self._env.physics, domain)
++
++        # Apply video_hard background distraction
++        if video_hard:
++            from envs.video_hard_wrapper import VideoHardWrapper
++            self._env = VideoHardWrapper(
++                self._env, domain, seed=seed + 2000,
++                random_frames=video_random_frames,
++                recolor_rgba=recolor_rgba,
++            )
++            if self._small:
++                from envs.small_variant import (
++                    apply_small_camera, apply_small_backcube,
++                )
++                self._env.reset()
++                apply_small_camera(self._env.physics, domain)
++                apply_small_backcube(self._env.physics, domain)
++
+         self._action_repeat = action_repeat
+         self._size = size
+         if camera is None:
+@@ -42,6 +85,54 @@ class DeepMindControl(gym.Env):
+         self._camera = camera
+         self.reward_range = [-np.inf, np.inf]
+ 
++        # Pixel-level DAVIS video background (camera-agnostic; for top-down domains
++        # like reacher where the video_hard skybox is not in the camera view).
++        self._pixel_video_bg = pixel_video_bg
++        if pixel_video_bg:
++            self._pvb_rng = np.random.RandomState(seed + 3000)
++            self._pvb_random = video_random_frames
++            self._pvb_videos = _load_davis_videos(davis_path)
++            self._pvb_bg_keywords = ("ground", "floor", "wall")
++            self._pvb_bg_geoms = None
++            if not self._pvb_videos:
++                print(f"WARNING: pixel_video_bg on but no DAVIS frames at {davis_path}")
++            self._pvb_reset_video()
++
++    def _pvb_reset_video(self):
++        if not self._pvb_videos:
++            return
++        self._pvb_vid = self._pvb_videos[self._pvb_rng.randint(len(self._pvb_videos))]
++        self._pvb_idx = self._pvb_rng.randint(len(self._pvb_vid))
++
++    def _pvb_frame(self):
++        if not self._pvb_videos:
++            return None
++        if self._pvb_random:
++            vid = self._pvb_videos[self._pvb_rng.randint(len(self._pvb_videos))]
++            p = vid[self._pvb_rng.randint(len(vid))]
++        else:
++            p = self._pvb_vid[self._pvb_idx % len(self._pvb_vid)]
++            self._pvb_idx += 1
++        img = Image.open(p).convert("RGB").resize(self._size, Image.BILINEAR)
++        return np.asarray(img, np.uint8)
++
++    def _pvb_background_mask(self, physics):
++        seg = physics.render(*self._size, camera_id=self._camera, segmentation=True)
++        geom = seg[..., 0]
++        mask = geom < 0
++        if self._pvb_bg_geoms is None:
++            bg = set()
++            for gid in np.unique(geom):
++                if gid < 0:
++                    continue
++                nm = physics.model.id2name(int(gid), "geom") or ""
++                if any(k in nm.lower() for k in self._pvb_bg_keywords):
++                    bg.add(int(gid))
++            self._pvb_bg_geoms = bg
++        for gid in self._pvb_bg_geoms:
++            mask |= (geom == gid)
++        return mask
++
+     @property
+     def observation_space(self):
+         spaces = {}
+@@ -80,6 +171,8 @@ class DeepMindControl(gym.Env):
+ 
+     def reset(self, **kwargs):
+         time_step = self._env.reset()
++        if self._pixel_video_bg:
++            self._pvb_reset_video()
+         obs = dict(time_step.observation)
+         obs = {key: [val] if len(val.shape) == 0 else val for key, val in obs.items()}
+         obs["image"] = self.render()
+@@ -91,4 +184,13 @@ class DeepMindControl(gym.Env):
+     def render(self, *args, **kwargs):
+         if kwargs.get("mode", "rgb_array") != "rgb_array":
+             raise ValueError("Only render mode 'rgb_array' is supported.")
+-        return self._env.physics.render(*self._size, camera_id=self._camera)
++        rgb = self._env.physics.render(*self._size, camera_id=self._camera)
++        if not self._pixel_video_bg:
++            return rgb
++        frame = self._pvb_frame()
++        if frame is None:
++            return rgb
++        mask = self._pvb_background_mask(self._env.physics)
++        out = rgb.copy()
++        out[mask] = frame[mask]
++        return out
+diff --git a/envs/wrappers.py b/envs/wrappers.py
+index 0d1682f..be065f1 100644
+--- a/envs/wrappers.py
++++ b/envs/wrappers.py
+@@ -15,17 +15,33 @@ class TimeLimit(gym.Wrapper):
+         assert self._step is not None, "Must reset environment."
+         obs, reward, done, info = self.env.step(action)
+         self._step += 1
++        # Always emit is_last (envs such as NoisyShape do not provide it).
++        is_last = False
+         if self._step >= self._duration:
+             done = True
++            is_last = True
+             if "discount" not in info:
+                 info["discount"] = np.array(1.0).astype(np.float32)
+             self._step = None
+-            # keep is_terminal as it is
+-            obs["is_last"] = True
++        obs["is_last"] = is_last
+         return obs, reward, done, info
+ 
+     def reset(self):
+         self._step = 0
++        obs = self.env.reset()
++        obs["is_last"] = False
++        return obs
++
++
++class FiveToFourTupleStep(gym.Wrapper):
++    """Adapt a gymnasium-style env (``step`` -> obs, reward, terminated,
++    truncated, info; ``reset`` -> obs) to the 4-tuple API used here."""
++
++    def step(self, action):
++        obs, reward, terminated, truncated, info = self.env.step(action)
++        return obs, reward, bool(terminated or truncated), info
++
++    def reset(self):
+         return self.env.reset()
+ 
+ 

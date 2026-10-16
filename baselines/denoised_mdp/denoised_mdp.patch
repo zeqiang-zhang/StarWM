@@ -1,0 +1,301 @@
+diff --git a/config.py b/config.py
+index 5f49fcd..d2a7988 100644
+--- a/config.py
++++ b/config.py
+@@ -132,6 +132,9 @@ class Config:
+             visualize_num_episodes: int = attrs.field(default=3, validator=attrs.validators.gt(0))
+             test_interval: int = attrs.field(default=10000, validator=attrs.validators.gt(0))
+             visualize_interval: int = attrs.field(default=20000, validator=attrs.validators.gt(0))
++            # If False, skip test episodes and all video/visualization saving (used for the
++            # StarWM baseline runs, which report training-episode returns: TB tag `train_reward`).
++            enable_visualize: bool = True
+ 
+         test: TestConfig = attrs.Factory(TestConfig)
+ 
+diff --git a/denoised_mdp/envs/dmc/__init__.py b/denoised_mdp/envs/dmc/__init__.py
+index 0343879..84e3386 100644
+--- a/denoised_mdp/envs/dmc/__init__.py
++++ b/denoised_mdp/envs/dmc/__init__.py
+@@ -16,6 +16,8 @@ VARIANTS = [
+     'video_background',
+     'video_background_noisy_sensor',
+     'video_background_camera_jitter',
++    'vh',  # DMC-GB2 video_hard background, sequential frames (StarWM paper: VH)
++    'vhr',  # DMC-GB2 video_hard background, random frame per step (StarWM paper: VHR)
+ ]
+ 
+ 
+@@ -80,12 +82,41 @@ def make_env(spec: str, observation_output_kind: EnvBase.ObsOutputKind, seed,
+             spatial_jitter=120,
+             background_remove_mode=background_remove_mode,
+         )
++    elif variant in ('vh', 'vhr'):
++        # Video Hard variants: use SimpleDMCEnv (mirrors the StarWM / R2-Dreamer pattern)
++        # to avoid performance issues with denoised_mdp's local dmc2gym fork +
++        # VideoHardWrapper interaction.
++        # Re-parse domain/task using rsplit to support multi-word domains
++        # like ball_in_cup_catch -> (ball_in_cup, catch).
++        vh_domain, vh_task = spec[:-(len(variant) + 1)].rsplit('_', maxsplit=1)
++
++        from .simple_dmc import SimpleDMCEnv
++
++        video_random_frames = (variant == 'vhr')
++
++        def make_simple_env(seed):
++            return SimpleDMCEnv(
++                domain_name=vh_domain,
++                task_name=vh_task,
++                seed=seed,
++                height=64,
++                width=64,
++                camera_id=0,
++                frame_skip=action_repeat,
++                episode_length=max_episode_length,
++                observation_output_kind=observation_output_kind,
++                video_hard=True,
++                video_random_frames=video_random_frames,
++            )
++
++        return make_batched_auto_reset_env(make_simple_env, seed, batch_shape)
+     else:
+         raise ValueError(f"Unexpected environment: {spec}")
+ 
+-    return make_batched_auto_reset_env(
+-        lambda seed: DMCWrapper(seed=as_SeedSequence(seed), **kwargs),
+-        seed, batch_shape)
++    def make_dmc_wrapper(seed):
++        return DMCWrapper(seed=as_SeedSequence(seed), **kwargs)
++
++    return make_batched_auto_reset_env(make_dmc_wrapper, seed, batch_shape)
+ 
+ 
+ __all__ = ['make_env']
+diff --git a/denoised_mdp/envs/dmc/simple_dmc.py b/denoised_mdp/envs/dmc/simple_dmc.py
+new file mode 100644
+index 0000000..b7d2777
+--- /dev/null
++++ b/denoised_mdp/envs/dmc/simple_dmc.py
+@@ -0,0 +1,190 @@
++"""
++Simple DMC env that mirrors the StarWM / R2-Dreamer pattern (used for the
++StarWM paper's VH / VHR baseline runs).
++
++Uses the dm_control suite directly + VideoHardWrapper applied at the dm_control
++level, the same way StarWM does it. Avoids denoised_mdp's local dmc2gym fork,
++which has performance issues when combined with VideoHardWrapper.
++
++VideoHardWrapper (and the DMC-GB2 ``dmcgb`` module it uses) is the shared copy
++from the StarWM repository; ``baselines/setup_baselines.sh`` installs it as the
++top-level package ``envs/`` of this checkout (next to ``main.py``).
++
++Implements denoised_mdp's EnvBase interface.
++"""
++
++from typing import Optional, Tuple, Union, Any
++import numpy as np
++import torch
++import gym
++import gym.spaces
++
++from ..abc import EnvBase
++from ..utils import as_SeedSequence
++
++
++class SimpleDMCEnv(EnvBase):
++    """Minimal DMC environment using dm_control suite directly.
++
++    Mirrors the StarWM / R2-Dreamer DeepMindControl class but implements
++    denoised_mdp's EnvBase interface.
++    """
++
++    def __init__(self,
++                 domain_name: str,
++                 task_name: str,
++                 *,
++                 seed,
++                 height: int = 64,
++                 width: int = 64,
++                 camera_id: int = 0,
++                 frame_skip: int = 2,
++                 episode_length: int = 1000,
++                 observation_output_kind: 'EnvBase.ObsOutputKind' = EnvBase.ObsOutputKind.image_uint8,
++                 video_hard: bool = False,
++                 video_random_frames: bool = False):
++        self._domain_name = domain_name
++        self._task_name = task_name
++        self._height = height
++        self._width = width
++        self._camera_id = camera_id if camera_id is not None else dict(quadruped=2).get(domain_name, 0)
++        self._frame_skip = frame_skip
++        self._episode_length = episode_length
++        self._observation_output_kind = observation_output_kind
++        self._video_hard = video_hard
++        self._video_random_frames = video_random_frames
++
++        # Use the standard dm_control suite (NOT the local fork in dmc2gym)
++        # This matches StarWM / R2-Dreamer.
++        from dm_control import suite
++
++        # Initial seed to int for suite.load
++        ss = as_SeedSequence(seed)
++        int_seed = int(ss.spawn(1)[0].generate_state(1, dtype='uint32')[0])
++        self._env = suite.load(
++            domain_name=domain_name,
++            task_name=task_name,
++            task_kwargs={'random': int_seed},
++        )
++
++        # Apply VideoHardWrapper at the dm_control level (same pattern as StarWM / R2-Dreamer)
++        if video_hard:
++            from envs.video_hard_wrapper import VideoHardWrapper
++            vh_seed = int(ss.spawn(1)[0].generate_state(1, dtype='uint32')[0])
++            self._env = VideoHardWrapper(
++                self._env, domain_name, seed=vh_seed,
++                random_frames=video_random_frames,
++            )
++
++        # action space (normalized to [-1, 1])
++        spec = self._env.action_spec()
++        self._action_dim = spec.shape[0]
++        self._true_action_low = spec.minimum.astype(np.float32)
++        self._true_action_high = spec.maximum.astype(np.float32)
++        self._norm_action_space = gym.spaces.Box(
++            low=-1.0, high=1.0, shape=(self._action_dim,), dtype=np.float32)
++
++        # observation space (image only)
++        self._observation_space = EnvBase.ObsOutputKind.get_observation_space(
++            observation_output_kind, height, width)
++
++        self._steps_taken = 0
++        self._np_random = np.random.Generator(np.random.PCG64(int_seed))
++
++    # ----------- EnvBase abstract methods -----------
++
++    @property
++    def max_episode_length(self) -> int:
++        return self._episode_length
++
++    @property
++    def observation_output_kind(self) -> 'EnvBase.ObsOutputKind':
++        return self._observation_output_kind
++
++    @property
++    def action_repeat(self) -> int:
++        return self._frame_skip
++
++    @property
++    def observation_space(self) -> gym.spaces.Box:
++        return self._observation_space
++
++    @property
++    def action_space(self) -> gym.spaces.Box:
++        return self._norm_action_space
++
++    def sample_random_action(self, size=(), np_rng=None) -> torch.Tensor:
++        if np_rng is None:
++            np_rng = np.random
++        return torch.as_tensor(
++            np_rng.uniform(-1, 1, size=tuple(size) + (self._action_dim,)),
++            dtype=torch.float32,
++        )
++
++    def _convert_action(self, action: np.ndarray) -> np.ndarray:
++        # action in [-1, 1] -> true action range
++        action = action.astype(np.float64)
++        true_delta = self._true_action_high - self._true_action_low
++        norm_delta = 2.0  # 1 - (-1)
++        action = (action - (-1.0)) / norm_delta
++        action = action * true_delta + self._true_action_low
++        return action.astype(np.float32)
++
++    def _render(self) -> np.ndarray:
++        # render via dm_control physics, same as StarWM
++        return self._env.physics.render(
++            height=self._height, width=self._width, camera_id=self._camera_id)
++
++    def render(self):
++        return self._render()
++
++    def _get_obs(self) -> torch.Tensor:
++        obs_np = self._render()
++        return self.ndarray_uint8_image_to_observation(obs_np, target_shape=None)
++
++    def reset(self) -> Tuple[torch.Tensor, 'EnvBase.Info']:
++        self._steps_taken = 0
++        self._env.reset()
++        obs = self._get_obs()
++        return obs, EnvBase.Info(actual_env_steps_taken=0)
++
++    def step(self, action) -> Tuple[torch.Tensor, Any, Any, 'EnvBase.Info']:
++        if isinstance(action, torch.Tensor):
++            action = action.detach().cpu().numpy()
++        action = np.asarray(action, dtype=np.float32)
++        if not self._norm_action_space.contains(action):
++            action = np.clip(action, -1.0, 1.0)
++        action = self._convert_action(action)
++
++        reward = 0.0
++        actual_env_steps_taken = 0
++        done = False
++        for _ in range(self._frame_skip):
++            time_step = self._env.step(action)
++            reward += time_step.reward or 0.0
++            actual_env_steps_taken += 1
++            self._steps_taken += 1
++            if time_step.last() or self._steps_taken >= self._episode_length:
++                done = True
++                break
++
++        obs = self._get_obs()
++        return obs, reward, done, EnvBase.Info(actual_env_steps_taken=actual_env_steps_taken)
++
++    def get_random_state(self) -> Any:
++        return (
++            self._np_random.bit_generator.state,
++            self._env.task.random.get_state() if hasattr(self._env, 'task') else None,
++        )
++
++    def set_random_state(self, random_state):
++        self._np_random.bit_generator.state = random_state[0]
++        if random_state[1] is not None and hasattr(self._env, 'task'):
++            self._env.task.random.set_state(random_state[1])
++
++    def seed(self, seed: Union[int, np.random.SeedSequence]):
++        ss = as_SeedSequence(seed)
++        int_seed = int(ss.spawn(1)[0].generate_state(1, dtype='uint32')[0])
++        self._np_random = np.random.Generator(np.random.PCG64(int_seed))
++        if hasattr(self._env, 'task'):
++            self._env.task.random.seed(int_seed)
+diff --git a/main.py b/main.py
+index f33bf05..bcacaa0 100644
+--- a/main.py
++++ b/main.py
+@@ -430,6 +430,9 @@ class ModelTrainer(object):
+             logging.info(f'num_env_steps={self.num_env_steps}: test')
+             do_visualize = force_visualize
+             do_visualize |= (self.num_env_steps - self.train_info['last_visualize']['num_env_steps']) >= self.cfg.learning.test.visualize_interval
++            # Override: skip visualization when disabled in config
++            if not self.cfg.learning.test.enable_visualize:
++                do_visualize = False
+             test_rewards = self.test(
+                 str(self.num_env_steps).zfill(len(str(self.cfg.learning.exploration.total_steps))) if do_visualize else None,
+                 visualize_num_episodes=self.cfg.learning.test.visualize_num_episodes,
+@@ -465,7 +468,8 @@ class ModelTrainer(object):
+                 train()
+ 
+             if (self.num_env_steps - self.train_info['last_test']['num_env_steps']) >= self.cfg.learning.test.test_interval:
+-                test()
++                if self.cfg.learning.test.enable_visualize:  # False: no test episodes at all
++                    test()
+                 test_update_to_date = True
+ 
+             if (self.num_env_steps - self.train_info['last_checkpoint']['num_env_steps']) >= self.cfg.learning.checkpoint_interval:
+@@ -498,7 +502,7 @@ class ModelTrainer(object):
+                 self.train_info['last_train']['total_complete_episodes'] += 1
+                 self.train_info['last_train']['current_episode_reward'] = 0
+ 
+-        if not test_update_to_date:
++        if not test_update_to_date and self.cfg.learning.test.enable_visualize:
+             test(force_visualize=True)
+         if not save_up_to_date:
+             save()

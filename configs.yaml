@@ -1,0 +1,384 @@
+# Configuration for train.py.  `defaults` is always loaded first, then every
+# preset passed via `--configs a b ...` (later ones override earlier ones), then
+# individual command-line flags `--key value`.
+#
+# The StarWM values below are the ones used for every result in the paper
+# (Table 1, Appendix B.2); they are only read by the StarWM model and are
+# ignored by the DreamerV3 baseline.
+
+defaults:
+  # ---------------------------------------------------------------- model --
+  # starwm | dreamerv3 | dualstream | attention_only   (see train.py)
+  model: starwm
+
+  # StarWM: cross-attention routing (Section 3.1)
+  crossattn_num_queries: 4        # N
+  crossattn_num_heads: 4          # H (head dim = 256 / 4 = 64)
+  crossattn_proj_dim: 256         # C, 1x1 conv projection of the 8x8 features
+  crossattn_pe_type: '2d_sin'     # positional encoding added to the keys
+  # StarWM: self-supervised attention guidance (Section 3.2)
+  attn_inv_scale: 1.0             # lambda_inv
+  infonce_scale: 1.0              # lambda_ctr
+  infonce_temp: 0.1               # tau
+  infonce_proj_dim: 128           # D_p
+  attn_reward_scale: 0.0          # > 0 enables StarWM-R (reward prediction from e_attn)
+  inv_delay: 0                    # inverse-dynamics window offset (delayed-action exp.)
+  # StarWM: gradient isolation (Section 3.2, Appendix E.2)
+  detach_attn_for_rssm: True      # "detach A": RSSM input uses sg(A)
+  detach_attn_for_recon: True     # "detach B": decoder uses sg(A)
+  detach_encoder_for_attn: False
+  # Residual (background) stream, StarWM and the dual-stream ablation (Section 3.3)
+  res_dim: 128                    # D_bg
+  use_res_kl: True
+  use_res_kl_free: True
+  res_kl_free: 1.0                # free bits kappa
+  Annealing: True                 # anneal beta_bg linearly ...
+  res_kl_scale_init: 5.0          # ... from 5.0
+  res_kl_scale: 0.5               # ... to 0.5 (final beta_bg)
+  res_kl_anneal_steps: 15000      # ... over the first 15k updates
+  res_detach_encoder: False
+  proj_dyn_mlp: True
+  dyn_dim: 0                      # 0 = size of the routed features
+  # Attention-only ablation: attention annealing (0 = off, as in the paper)
+  attn_anneal_steps: 0
+
+  # Self-supervised heads of the "+ SS" ablations (dreamerv3 / dualstream models)
+  use_inverse_model: False
+  use_inverse_ce: False
+  inv_scale: 20.0
+  use_contrastive_loss: False
+  contrastive_loss_scale: 1.0
+  contrastive_temperature: 0.1
+  contrastive_proj_dim: 128
+  legacy_ss_ablation: False       # True: SS heads exactly as in the first paper version (see models.py)
+
+  # ---------------------------------------------------------- environment --
+  task: 'dmc_walker_walk'
+  size: [64, 64]
+  envs: 1
+  action_repeat: 2
+  time_limit: 1000
+  prefill: 2500
+  reward_EMA: True
+  # DMC distractors
+  use_video_hard: False           # VH: DMC-GB2 video_hard background
+  video_random_frames: False      # VHR: random frame every step (with use_video_hard)
+  pixel_video_bg: False           # DAVIS pasted behind the agent (Reacher, top-down camera)
+  recolor_agent: False            # low-contrast agent (Appendix F.3)
+  recolor_rgba: [0.52, 0.47, 0.42, 1.0]
+  # DAVIS 2017 JPEGImages/480p directory (NoisyShape family, Reacher).
+  # Empty -> taken from the DAVIS_DIR environment variable.
+  distracting_background_path: ''
+  # Shape-environment options
+  passive_reward_mode: noise
+  tex_level: 1                    # textured NoisyShape: 1 / 2 / 3 (L1-L3)
+  tex_alpha: 0.5
+  action_delay: 0                 # ActionDelay(k)
+
+  # ------------------------------------------------------------- logging --
+  logdir: null
+  traindir: null
+  evaldir: null
+  offline_traindir: ''
+  offline_evaldir: ''
+  seed: 0
+  deterministic_run: False
+  steps: 1e6
+  parallel: False
+  eval_every: 1e4
+  eval_episode_num: 10
+  log_every: 1e4
+  reset_every: 0
+  checkpoint_every: 0             # >0: also keep checkpoints/agent_step{N}.pt
+  device: 'cuda:0'
+  compile: True
+  precision: 32
+  video_pred_log: True
+  skip_actor_critic: False
+
+  # ------------------------------------------------ DreamerV3 (unchanged) --
+  dyn_hidden: 512
+  dyn_deter: 512
+  dyn_stoch: 32
+  dyn_discrete: 32
+  dyn_rec_depth: 1
+  dyn_mean_act: 'none'
+  dyn_std_act: 'sigmoid2'
+  dyn_min_std: 0.1
+  grad_heads: ['decoder', 'reward', 'cont']
+  units: 512
+  act: 'SiLU'
+  norm: True
+  encoder:
+    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+  decoder:
+    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+  actor:
+    {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic:
+    {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  reward_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  cont_head:
+    {layers: 2, loss_scale: 1.0, outscale: 1.0}
+  dyn_scale: 0.5
+  rep_scale: 0.1
+  kl_free: 1.0
+  weight_decay: 0.0
+  unimix_ratio: 0.01
+  initial: 'learned'
+
+  # Training
+  batch_size: 16
+  batch_length: 64
+  train_ratio: 512
+  pretrain: 100
+  model_lr: 1e-4
+  opt_eps: 1e-8
+  grad_clip: 1000
+  dataset_size: 1000000
+  opt: 'adam'
+
+  # Behavior
+  discount: 0.997
+  discount_lambda: 0.95
+  imag_horizon: 15
+  imag_gradient: 'dynamics'
+  imag_gradient_mix: 0.0
+  eval_state_mean: False
+
+  # Exploration (greedy = none)
+  expl_behavior: 'greedy'
+  expl_until: 0
+  expl_extr_scale: 0.0
+  expl_intr_scale: 1.0
+  disag_target: 'stoch'
+  disag_log: True
+  disag_models: 10
+  disag_offset: 1
+  disag_layers: 4
+  disag_units: 400
+  disag_action_cond: False
+
+
+# =============================================================================
+# Benchmark presets
+# =============================================================================
+
+# DeepMind Control from pixels. Clean / VHR: --steps 1e6, VH: --steps 3e6.
+dmc_vision:
+  steps: 1e6
+  action_repeat: 2
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+# Shape family (reward-free; world model only, 200-step episodes). With
+# eval_every=1e4 the loop stops at the first chunk past steps+eval_every,
+# i.e. a 2e5-step run ends at ~212k env steps, as in the paper.
+shape:
+  task: shape_default
+  skip_actor_critic: True
+  steps: 2e5
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  prefill: 2500
+  eval_every: 1e4
+  time_limit: 200
+  actor: {layers: 2, dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+shapefixed:
+  task: shapefixed_default
+  skip_actor_critic: True
+  steps: 5e4
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  prefill: 2500
+  eval_every: 1e4
+  time_limit: 200
+  actor: {layers: 2, dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+noisyshape:
+  task: noisyshape_default
+  skip_actor_critic: True
+  steps: 2e5
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  prefill: 2500
+  eval_every: 1e4
+  time_limit: 200
+  actor: {layers: 2, dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+noisyshapeseq:
+  task: noisyshapeseq_default
+  skip_actor_critic: True
+  steps: 2e5
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  prefill: 2500
+  eval_every: 1e4
+  time_limit: 200
+  actor: {layers: 2, dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+noisyshapemotion:
+  task: noisyshapemotion_default
+  skip_actor_critic: True
+  steps: 2e5
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  prefill: 2500
+  eval_every: 1e4
+  time_limit: 200
+  actor: {layers: 2, dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+# NoisyTwoShape was trained for 400k steps.
+noisytwoshape:
+  task: noisytwoshape_default
+  skip_actor_critic: True
+  steps: 4e5
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  prefill: 2500
+  eval_every: 1e4
+  time_limit: 200
+  actor: {layers: 2, dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+passiveshape:
+  task: passiveshape_default
+  skip_actor_critic: True
+  steps: 2e5
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  prefill: 2500
+  eval_every: 1e4
+  time_limit: 200
+  actor: {layers: 2, dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+passiveshapeseq:
+  task: passiveshapeseq_default
+  skip_actor_critic: True
+  steps: 2e5
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  prefill: 2500
+  eval_every: 1e4
+  time_limit: 200
+  actor: {layers: 2, dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+# Textured ladder; choose the level with --tex_level 1|2|3 (paper: 400k steps).
+texnoisyshape:
+  task: texnoisyshape_default
+  skip_actor_critic: True
+  steps: 4e5
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  prefill: 2500
+  eval_every: 1e4
+  time_limit: 200
+  actor: {layers: 2, dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+
+# =============================================================================
+# Model presets (combine with a benchmark preset, e.g. --configs noisyshape ss_only)
+# =============================================================================
+
+# DreamerV3 baseline
+dreamerv3:
+  model: dreamerv3
+
+# Table 4 / Fig. 3 ablation rows on NoisyShape
+dualstream:            # "+ dual-stream only"
+  model: dualstream
+ss_only:               # "+ SS only": inverse dynamics + InfoNCE on the encoder output
+  model: dreamerv3
+  use_inverse_model: True
+  inv_scale: 10.0
+  use_contrastive_loss: True
+  contrastive_loss_scale: 1.0
+  contrastive_temperature: 0.1
+dualstream_ss:         # "+ dual-stream + SS": same heads on the dual-stream model
+  model: dualstream
+  use_inverse_ce: True
+  inv_scale: 10.0
+  use_contrastive_loss: True
+  contrastive_loss_scale: 1.0
+  contrastive_temperature: 0.1
+# The two SS ablations exactly as run for the first paper version
+# (misaligned inverse target on RSSM features, see models.py).
+ss_only_legacy:
+  model: dreamerv3
+  legacy_ss_ablation: True
+  use_inverse_model: True
+  inv_scale: 10.0
+  use_contrastive_loss: True
+  contrastive_loss_scale: 1.0
+  contrastive_temperature: 0.1
+dualstream_ss_legacy:
+  model: dualstream
+  legacy_ss_ablation: True
+  use_inverse_model: True
+  use_inverse_ce: True
+  inv_scale: 10.0
+  use_contrastive_loss: True
+  contrastive_loss_scale: 1.0
+  contrastive_temperature: 0.1
+attention_only:        # "+ attention only"
+  model: attention_only
+
+# Gradient-isolation ablations (Table 6; symbols as in the paper)
+iso_star1:             # no detach A/B, with SS
+  detach_attn_for_rssm: False
+  detach_attn_for_recon: False
+iso_star2:             # no detach A/B, no SS
+  detach_attn_for_rssm: False
+  detach_attn_for_recon: False
+  attn_inv_scale: 0.0
+  infonce_scale: 0.0
+iso_star3:             # only detach B, no SS
+  detach_attn_for_rssm: False
+  attn_inv_scale: 0.0
+  infonce_scale: 0.0
+iso_star4:             # only detach B, with SS
+  detach_attn_for_rssm: False
+
+# Self-supervised signal ablations (Appendix E.3)
+inv_only:
+  infonce_scale: 0.0
+ctr_only:
+  attn_inv_scale: 0.0
+
+
+debug:
+  pretrain: 1
+  prefill: 1
+  batch_size: 10
+  batch_length: 20

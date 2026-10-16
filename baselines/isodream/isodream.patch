@@ -1,0 +1,232 @@
+diff --git a/iso_rl/configs.yaml b/iso_rl/configs.yaml
+index 2ede8fe..0741b2b 100644
+--- a/iso_rl/configs.yaml
++++ b/iso_rl/configs.yaml
+@@ -47,6 +47,9 @@ defaults:
+   prefill: 2500
+   eval_noise: 0.0
+   clip_rewards: 'identity'
++  # DMC-GB2 video_hard distractor (VH); with video_random_frames: random frame per step (VHR)
++  use_video_hard: False
++  video_random_frames: False
+ 
+   # Model
+   dyn_cell: 'gru'
+@@ -364,6 +367,68 @@ carla:
+   kl_free: '1.0'
+   kl_scale: '1.0'
+ 
++noisyshape:
++
++  # NoisyShape (shapeenv package; DAVIS frames from $DAVIS_DIR).
++  # General — copied from `dmc` config; only task / discrete-action /
++  # episode-length / step-count / precision fields differ from dmc.
++  task: 'noisyshape_default'
++  steps: 200000
++  eval_every: 5e3
++  log_every: 5e3
++  prefill: 2500
++  dataset_size: 0
++  pretrain: 100
++  action_step: 50
++  free_step: 40
++  use_free: False
++  rollout_policy: False
++  autoencoder: False
++  min_free: True
++  max_action: True
++  encoder_add_action: True
++  sz_sparse: False
++  precision: 32
++
++  # Environment — NoisyShape is Discrete(4), 200-step episodes, no action-repeat
++  davis_path: ''  # DAVIS 2017 JPEGImages/480p; empty -> $DAVIS_DIR
++  size: [64, 64]
++  time_limit: 200
++  action_repeat: 1
++  train_every: 5
++  train_steps: 1
++
++  # Model
++  grad_heads: ['image', 'reward']
++  dyn_cell: 'gru_layer_norm'
++  pred_discount: False
++  cnn_depth: 32
++  dyn_deter: 200
++  dyn_stoch: 50
++  dyn_discrete: 0
++  reward_layers: 2
++  discount_layers: 3
++  value_layers: 3
++  actor_layers: 4
++
++  # Behavior — discrete-action overrides for NoisyShape
++  actor_dist: 'onehot'
++  expl_amount: 0.0
++  actor_entropy: '1e-4'
++  discount: 0.99
++  imag_gradient: 'reinforce'
++  imag_gradient_mix: 1.0
++
++  # Training
++  reward_scale: 2
++  weight_decay: 0.0
++  model_lr: 3e-4
++  value_lr: 8e-5
++  actor_lr: 8e-5
++  opt_eps: 1e-5
++  kl_free: '1.0'
++  kl_scale: '1.0'
++
+ debug:
+ 
+   debug: True
+diff --git a/iso_rl/dreamer.py b/iso_rl/dreamer.py
+index fe3aeb7..29e11d8 100644
+--- a/iso_rl/dreamer.py
++++ b/iso_rl/dreamer.py
+@@ -5,7 +5,6 @@ import os
+ import pathlib
+ import sys
+ import warnings
+-from agents.navigation.carla_env_dream import CarlaEnv
+ 
+ os.environ['MUJOCO_GL'] = 'egl'
+ 
+@@ -195,7 +194,11 @@ def make_dataset(episodes, config):
+ def make_env(config, logger, mode, train_eps, eval_eps):
+   suite, task = config.task.split('_', 1)
+   if suite == 'dmc':
+-    env = wrappers.DeepMindControl(task, config.action_repeat, config.size)
++    env = wrappers.DeepMindControl(
++        task, config.action_repeat, config.size,
++        seed=config.seed,
++        video_hard=getattr(config, 'use_video_hard', False),
++        video_random_frames=getattr(config, 'video_random_frames', False))
+     env = wrappers.NormalizeActions(env)
+   elif suite == 'dmcbg':
+     env = wrappers.DeepMindControlGen(task, config.seed, config.action_repeat, config.size, config.eval_mode)
+@@ -214,7 +217,18 @@ def make_env(config, logger, mode, train_eps, eval_eps):
+         mode if 'train' in mode else 'test',
+         config.action_repeat)
+     env = wrappers.OneHotAction(env)
++  elif suite == 'noisyshape':
++    # NoisyShape diagnostic env from the `shapeenv` package (StarWM paper,
++    # Sec. 4.1). Empty davis_path -> $DAVIS_DIR.
++    import shapeenv
++    base = shapeenv.make(
++        'noisyshape', size=tuple(config.size), seed=config.seed,
++        davis_path=getattr(config, 'davis_path', '') or None,
++        include_attr_obs=False)
++    env = wrappers.NoisyShapeAdapter(base)
++    env = wrappers.OneHotAction(env)
+   elif suite == 'carla':
++    from agents.navigation.carla_env_dream import CarlaEnv
+     env = CarlaEnv(
+             render_display=False,  # for local debugging only
+             display_text=False,  # for local debugging only
+@@ -333,6 +347,10 @@ def main(config):
+       random_actor = torchd.independent.Independent(
+             torchd.uniform.Uniform(torch.Tensor([acts.low.min(), acts.low.min()])[None],
+                                   torch.Tensor([acts.high.max(), acts.high.max()])[None]), 1)
++    elif getattr(acts, 'discrete', False) or hasattr(acts, 'n'):
++      n_act = acts.n if hasattr(acts, 'n') else acts.shape[0]
++      random_actor = torchd.one_hot_categorical.OneHotCategorical(
++          logits=torch.zeros(1, n_act))
+     else:
+       random_actor = torchd.independent.Independent(
+           torchd.uniform.Uniform(torch.Tensor(acts.low)[None],
+@@ -382,7 +400,8 @@ if __name__ == '__main__':
+   parser = argparse.ArgumentParser()
+   parser.add_argument('--configs', nargs='+', required=True)
+   args, remaining = parser.parse_known_args()
+-  configs = yaml.safe_load(
++  _yaml = yaml.YAML(typ='safe', pure=True)
++  configs = _yaml.load(
+       (pathlib.Path(sys.argv[0]).parent / 'configs.yaml').read_text())
+   defaults = {}
+   for name in args.configs:
+diff --git a/iso_rl/wrappers.py b/iso_rl/wrappers.py
+index d1661c9..94f46ab 100644
+--- a/iso_rl/wrappers.py
++++ b/iso_rl/wrappers.py
+@@ -1,6 +1,6 @@
+ import threading
+ 
+-import gym
++import gymnasium as gym
+ import numpy as np
+ 
+ 
+@@ -105,16 +105,22 @@ class DeepMindLabyrinth(object):
+ 
+ class DeepMindControl:
+ 
+-  def __init__(self, name, action_repeat=1, size=(64, 64), camera=None):
++  def __init__(self, name, action_repeat=1, size=(64, 64), camera=None,
++               seed=0, video_hard=False, video_random_frames=False):
+     domain, task = name.split('_', 1)
+     if domain == 'cup':  # Only domain with multiple words.
+       domain = 'ball_in_cup'
+     if isinstance(domain, str):
+       from dm_control import suite
+-      self._env = suite.load(domain, task)
++      self._env = suite.load(domain, task, task_kwargs={'random': seed})
+     else:
+       assert task is None
+       self._env = domain()
++    if video_hard:
++      from envs.video_hard_wrapper import VideoHardWrapper
++      self._env = VideoHardWrapper(
++          self._env, domain, seed=seed + 2000,
++          random_frames=video_random_frames)
+     self._action_repeat = action_repeat
+     self._size = size
+     if camera is None:
+@@ -462,3 +468,46 @@ class SelectAction:
+ 
+   def step(self, action):
+     return self._env.step(action[self._key])
++
++
++class NoisyShapeAdapter:
++  """Adapt gymnasium-style NoisyShape envs (5-tuple step, dict obs with bool keys)
++  to the IsoDream gym-style 4-tuple interface with image-only obs dict."""
++
++  def __init__(self, env):
++    self._env = env
++
++  def __getattr__(self, name):
++    return getattr(self._env, name)
++
++  @property
++  def observation_space(self):
++    return gym.spaces.Dict({
++        'image': gym.spaces.Box(0, 255, self._env._size + (3,), dtype=np.uint8),
++    })
++
++  @property
++  def action_space(self):
++    return self._env.action_space
++
++  def _strip_obs(self, obs):
++    return {'image': obs['image']}
++
++  def reset(self, **kwargs):
++    out = self._env.reset(**kwargs)
++    if isinstance(out, tuple):
++      obs, _info = out
++    else:
++      obs = out
++    return self._strip_obs(obs)
++
++  def step(self, action):
++    out = self._env.step(action)
++    if len(out) == 5:
++      obs, reward, terminated, truncated, info = out
++      done = bool(terminated or truncated)
++    else:
++      obs, reward, done, info = out
++    info = dict(info)
++    info.setdefault('discount', np.array(1.0, dtype=np.float32))
++    return self._strip_obs(obs), float(reward), done, info
