@@ -138,10 +138,11 @@ The training loop, RSSM and actor-critic come from
 ## Citation
 
 ```bibtex
-@article{zhang2026starwm,
-  title   = {StarWM: Self-Supervised Trained Attention Routing for Robust World Models},
-  author  = {Zhang, Zeqiang and Wurzberger, Fabian and Otte, Maximilian and Schmid, Daniel and
-             Gottwald, Sebastian and Raulf, Arne Peter and Braun, Daniel Alexander},
-  year    = {2026}
+@inproceedings{zhang2026starwm,
+  title     = {StarWM: Self-Supervised Trained Attention Routing for Robust World Models},
+  author    = {Zhang, Zeqiang and Wurzberger, Fabian and Otte, Maximilian and Schmid, Daniel and
+               Gottwald, Sebastian and Raulf, Arne Peter and Braun, Daniel Alexander},
+  booktitle = {The 40th Annual Conference on Neural Information Processing Systems (NeurIPS 2026)},
+  year      = {2026}
 }
 ```
