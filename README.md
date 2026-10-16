@@ -1,7 +1,6 @@
 # StarWM: Self-Supervised Trained Attention Routing for Robust World Models
 
-Official code for **StarWM** (Zeqiang Zhang, Fabian Wurzberger, Maximilian Otte, Daniel Schmid,
-Sebastian Gottwald, Arne Peter Raulf, Daniel Alexander Braun).
+Official code for **StarWM**(NeurIPS'26).
 
 ![StarWM overview](assets/starwm_overview.png)
 
